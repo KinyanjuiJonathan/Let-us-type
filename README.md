@@ -5,7 +5,14 @@ rhythm: varied key holds and gaps, overlapping keys, bursts, pauses, typos
 that get corrected, and later revisions. The finished text always matches
 what you entered.
 
-## Run
+## Install (Windows)
+
+Download `AutoTyperSetup.exe` from the
+[latest release](https://github.com/KinyanjuiJonathan/Let-us-type/releases/latest)
+and run it. No Python needed. The installer is not code-signed, so Windows
+SmartScreen may warn: choose "More info", then "Run anyway".
+
+## Run from source
 
 ```bash
 pip install pynput

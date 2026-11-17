@@ -1,0 +1,58 @@
+name: Windows installer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install pynput pyinstaller
+
+      - name: Build the app
+        run: >
+          pyinstaller --noconfirm --noconsole --name AutoTyper
+          --hidden-import pynput.keyboard._win32
+          --hidden-import pynput.mouse._win32
+          autotyper.py
+
+      - name: Check the app starts
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\AutoTyper\AutoTyper.exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "AutoTyper.exe exited with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "0.0.0" }
+          & $iscc "/DAppVersion=$version" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoTyperSetup
+          path: dist/AutoTyperSetup.exe
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AutoTyperSetup.exe
