@@ -27,6 +27,19 @@ python autotyper.py
 Enter the text, press Start (or F6), and click into the target window before
 the countdown ends. F6 again stops it.
 
+## Formatting
+
+The text box understands `**bold**`, `*italic*` (also `__bold__`, `_italic_`)
+and `# headings`, and shows them styled. The markers are never typed. The
+Formatting setting decides what happens instead:
+
+- **Apply bold / italic** (default): the marked text is typed with Ctrl+B /
+  Ctrl+I switched on (Cmd on macOS), so it comes out bold or italic in editors
+  such as Word or Google Docs. Headings are typed bold.
+- **Drop markers, type plain**: use this for plain text boxes, where Ctrl+B
+  would do nothing or trigger something else.
+- **Type exactly as written**: types the symbols as they are.
+
 ## Lock onto the text box
 
 Tick "Lock onto the text box" to keep the typing in the box that has the

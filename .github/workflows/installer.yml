@@ -22,6 +22,16 @@ jobs:
       - name: Install build tools
         run: pip install pynput pyinstaller
 
+      - name: Screenshot the window
+        run: |
+          pip install pillow
+          python .github/scripts/screenshot.py window.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: window-screenshot
+          path: window.png
+
       - name: Build the app
         run: >
           pyinstaller --noconfirm --noconsole --name AutoTyper

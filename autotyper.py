@@ -10,6 +10,11 @@ Run:     python autotyper.py
 Use:     enter text, press Start (or F6), click into the target window
          before the countdown ends. F6 again (or Stop) cancels.
 
+Formatting: **bold**, *italic* and # headings in the text are not typed as
+symbols. The marked text is typed with Ctrl+B / Ctrl+I switched on (Cmd on
+macOS), or the markers are simply dropped, depending on the Formatting
+setting.
+
 Note: corrections assume a plain text field. Turn off autocorrect,
 auto-indent and auto-closing brackets in the target, or untick the
 arrow-key option, or the result can drift from the text you entered.
@@ -70,6 +75,60 @@ TECHNIQUES = {  # name: (keys may overlap, uses letter-pair fluency, timing spre
 }
 
 
+BOLD, ITALIC = 1, 2
+EMPH = re.compile(
+    r"(?<!\\)(\*\*\*|___)(?=\S)(.+?)(?<=\S)\1"
+    r"|(?<!\\)(\*\*|__)(?=\S)(.+?)(?<=\S)\3"
+    r"|(?<![\w*\\])(\*|_)(?=[^\s*_])(.+?)(?<=[^\s*_])\5(?![\w*])")
+HEADING = re.compile(r"(#{1,6})[ \t]+(?=\S)")
+
+
+def parse_markup(text):
+    """Read **bold**, *italic*, _italic_, __bold__ and # headings.
+
+    Returns [(index in text, character, style bits)] for every character that
+    should actually be typed; the markers themselves are left out.
+    """
+    out = []
+
+    def plain(s, off, style):
+        for i, c in enumerate(s):
+            if c == "\\" and s[i + 1:i + 2] in ("*", "_"):
+                continue                                    # \* means a real *
+            out.append((off + i, c, style))
+
+    def inline(s, off, style):
+        pos = 0
+        while True:
+            m = EMPH.search(s, pos)
+            if not m:
+                break
+            g = 1 if m.group(1) else 3 if m.group(3) else 5
+            mark, a = m.group(g), m.start()
+            if mark[0] == "_" and ((a > 0 and s[a - 1].isalnum())
+                                   or s[m.end():m.end() + 1].isalnum()):
+                plain(s[pos:a + 1], off + pos, style)        # snake_case, not emphasis
+                pos = a + 1
+                continue
+            plain(s[pos:a], off + pos, style)
+            bits = {3: BOLD | ITALIC, 2: BOLD, 1: ITALIC}[len(mark)]
+            inline(m.group(g + 1), off + m.start(g + 1), style | bits)
+            pos = m.end()
+        plain(s[pos:], off + pos, style)
+
+    off = 0
+    for line in text.split("\n"):
+        if off:
+            out.append((off - 1, "\n", 0))
+        h = HEADING.match(line)
+        if h:
+            inline(line[h.end():], off + h.end(), BOLD)
+        else:
+            inline(line, off, 0)
+        off += len(line) + 1
+    return out
+
+
 class Humanizer:
     """Turns text into a timed list of key events: [time, seq, 'press'|'release', key].
 
@@ -91,6 +150,7 @@ class Humanizer:
         self.rel, self.recent = {}, []
         self.shift_down, self.shift_press, self.shift_hold, self.shift_rel = False, 0, 0, -1
         self.buf, self.cur, self.defects, self.prev = [], 0, [], None
+        self.bufs, self.style, self.block = [], 0, -1.0     # styles typed, style now on
         self.x, self.burstf, self.wordf = 0.0, 1.0, 1.0
         self.burst_left = self._burst_len()
 
@@ -114,6 +174,7 @@ class Humanizer:
         tp = self.t + gap + self.pend
         self.pend = 0.0
         tp = max(tp, self.rel.get(key, -1) + 0.02)           # same key must be up first
+        tp = max(tp, self.block + .02)                       # Ctrl/Cmd must be up first
         if not (overlap and self.overlap) and self.recent:
             tp = max(tp, max(e[0] for _, e in self.recent) + u(.005, .03))
         hold = HOLD[cls] * self._ln(.25) * min(1.3, max(.8, self._slow())) ** .5
@@ -125,7 +186,8 @@ class Humanizer:
             self._emit(r, "release", "<shift>")
             self.shift_down, self.shift_rel = False, r
         if shift and not self.shift_down:                    # Shift leads the key
-            ts = max(tp - .09 * self._ln(.35), self.t + .008, self.shift_rel + .02)
+            ts = max(tp - .09 * self._ln(.35), self.t + .008, self.shift_rel + .02,
+                     self.block + .01)
             tp = max(tp, ts + .02)
             self._emit(ts, "press", "<shift>")
             self.shift_down = True
@@ -164,8 +226,42 @@ class Humanizer:
             g += self.rng.uniform(.15, .6) * self.ps
         return max(g, .03)
 
+    def _restyle(self, style):
+        """Switch bold/italic with Ctrl+B / Ctrl+I so the next key is typed in `style`."""
+        u = self.rng.uniform
+        for bit, letter in ((BOLD, "b"), (ITALIC, "i")):
+            if not (self.style ^ style) & bit:
+                continue
+            tp = self.t + u(.12, .45) * self._ln(.3) + self.pend
+            self.pend = 0.0
+            if self.recent:
+                tp = max(tp, max(e[0] for _, e in self.recent) + u(.01, .05))
+            tp = max(tp, self.block + .03)
+            if self.shift_down:
+                r = self.shift_press + max(.012, self.shift_hold * u(.6, 1.5))
+                self._emit(r, "release", "<shift>")
+                self.shift_down, self.shift_rel = False, r
+                tp = max(tp, r + .03)
+            self._emit(tp, "press", "<mod>")
+            t2 = max(tp + u(.06, .2), self.rel.get(letter, -1) + .02)
+            hold = u(.05, .12)
+            self._emit(t2, "press", letter)
+            self._emit(t2 + hold, "release", letter)
+            self.block = t2 + hold + u(.015, .1)
+            self._emit(self.block, "release", "<mod>")
+            self.rel[letter], self.t, self.recent = t2 + hold, t2, []
+        self.style, self.prev = style, None
+
+    def _caret_style(self):
+        # After moving or deleting, an editor types in the style of the character
+        # before the caret. Errors are only made where that is unambiguous.
+        if self.cur > 0:
+            self.style = self.bufs[self.cur - 1]
+
     # --- low level: keys that edit the buffer ---------------------------------
-    def ch(self, c):
+    def ch(self, c, style=0):
+        if style != self.style:
+            self._restyle(style)
         shift, overlap = False, True
         if c == "\n":
             key, cls, overlap = "<enter>", "special", False
@@ -187,6 +283,7 @@ class Humanizer:
             key, cls, overlap = c, "symbol", False           # sent as-is
         self._press(key, cls, self._gap(c, cls, shift), shift, overlap)
         self.buf.insert(self.cur, c)
+        self.bufs.insert(self.cur, style)
         self.cur += 1
         self.prev = c
 
@@ -202,12 +299,14 @@ class Humanizer:
         for _ in range(n):
             self._special("<backspace>", self._nav_gap())
             self.cur -= 1
-            del self.buf[self.cur]
+            del self.buf[self.cur], self.bufs[self.cur]
+        self._caret_style()
 
     def delete(self, n=1):
         for _ in range(n):
             self._special("<delete>", self._nav_gap())
-            del self.buf[self.cur]
+            del self.buf[self.cur], self.bufs[self.cur]
+        self._caret_style()
 
     def move(self, n):
         """Move the cursor n characters (negative = left)."""
@@ -216,10 +315,12 @@ class Humanizer:
             g = self._nav_gap(fast and i > 0) + (self.rng.uniform(.1, .3) if i == 0 else 0)
             self._special("<left>" if n < 0 else "<right>", g)
         self.cur += n
+        self._caret_style()
 
-    def type_str(self, s):
-        for c in s:
-            self.ch(c)
+    def type_str(self, s, style=0):
+        """Type s; style is one value for all of it or a list with one per character."""
+        for i, c in enumerate(s):
+            self.ch(c, style if isinstance(style, int) else style[i])
 
     # --- typos, fixed on the spot -----------------------------------------------
     def _wrong(self, c):
@@ -234,53 +335,53 @@ class Humanizer:
     def _notice(self):
         self.pause(self.rng.uniform(.15, .65) * self._ln(.3))
 
-    def type_word(self, w):
+    def type_word(self, w, st=0, first_ok=True):
         rng, i, arrows = self.rng, 0, self.revise
         while i < len(w):
             c, left = w[i], len(w) - i - 1
             p = self.error_rate * (1.4 if self.wordf > 1.1 else 1.0)
-            if not (c.isascii() and c.isalnum()) or rng.random() >= p:
-                self.ch(c)
+            if not (c.isascii() and c.isalnum()) or rng.random() >= p or (i == 0 and not first_ok):
+                self.ch(c, st)
                 i += 1
                 continue
             kind = rng.choice(["sub", "sub", "sub", "double", "omit", "swap"])
             if kind == "omit" and left >= 1:
                 k = min(rng.choice([1, 1, 2, 3]), left)
-                self.type_str(w[i + 1:i + 1 + k])
+                self.type_str(w[i + 1:i + 1 + k], st)
                 self._notice()
                 if arrows and rng.random() < .35:
-                    self.move(-k); self.ch(c); self.move(k)
+                    self.move(-k); self.ch(c, st); self.move(k)
                 else:
-                    self.backspace(k); self.type_str(w[i:i + 1 + k])
+                    self.backspace(k); self.type_str(w[i:i + 1 + k], st)
                 i += k + 1
             elif kind == "swap" and left >= 1 and w[i + 1] != c and w[i + 1].isalnum():
                 k = min(rng.choice([0, 0, 1]), left - 1)
-                self.ch(w[i + 1]); self.ch(c); self.type_str(w[i + 2:i + 2 + k])
+                self.ch(w[i + 1], st); self.ch(c, st); self.type_str(w[i + 2:i + 2 + k], st)
                 self._notice()
-                self.backspace(2 + k); self.type_str(w[i:i + 2 + k])
+                self.backspace(2 + k); self.type_str(w[i:i + 2 + k], st)
                 i += 2 + k
             elif kind == "double":
                 k = min(rng.choice([0, 0, 1]), left)
-                self.ch(c); self.ch(c); self.type_str(w[i + 1:i + 1 + k])
+                self.ch(c, st); self.ch(c, st); self.type_str(w[i + 1:i + 1 + k], st)
                 self._notice()
-                self.backspace(k + 1); self.type_str(w[i + 1:i + 1 + k])
+                self.backspace(k + 1); self.type_str(w[i + 1:i + 1 + k], st)
                 i += k + 1
             else:
                 wrong = self._wrong(c)
                 if wrong is None:
-                    self.ch(c)
+                    self.ch(c, st)
                     i += 1
                     continue
                 k = min(rng.choice([0, 0, 0, 1, 1, 2, 3]), left)
-                self.ch(wrong); self.type_str(w[i + 1:i + 1 + k])
+                self.ch(wrong, st); self.type_str(w[i + 1:i + 1 + k], st)
                 self._notice()
                 r = rng.random()
                 if arrows and k >= 1 and r < .2:
-                    self.move(-k); self.backspace(); self.ch(c); self.move(k)
+                    self.move(-k); self.backspace(); self.ch(c, st); self.move(k)
                 elif arrows and k >= 1 and r < .35:
-                    self.move(-k - 1); self.delete(); self.ch(c); self.move(k)
+                    self.move(-k - 1); self.delete(); self.ch(c, st); self.move(k)
                 else:
-                    self.backspace(k + 1); self.type_str(w[i:i + 1 + k])
+                    self.backspace(k + 1); self.type_str(w[i:i + 1 + k], st)
                 i += k + 1
 
     # --- revisions: slips left behind and fixed on a later read-through ---------
@@ -308,7 +409,7 @@ class Humanizer:
             return
         u = self.rng.uniform
         self.pause(u(.6, 2.5) * self.ps + .2)
-        for pos, wlen, correct in reversed(self.defects):   # last slip first
+        for pos, wlen, correct, st in reversed(self.defects):   # last slip first
             if 0 < wlen <= 2 and self.rng.random() < .35:
                 self.move(pos - self.cur)
                 self.pause(u(.15, .5))
@@ -317,7 +418,7 @@ class Humanizer:
                 self.move(pos + wlen - self.cur)
                 self.pause(u(.15, .5))
                 self.backspace(wlen)
-            self.type_str(correct)
+            self.type_str(correct, st)
             self.pause(u(.2, .7) * self.ps + .1)
         self.defects = []
         self.move(len(self.buf) - self.cur)
@@ -327,23 +428,34 @@ class Humanizer:
     def _burst_len(self):
         return int(self.rng.triangular(2, 16, 5))
 
-    def run(self, text):
+    def run(self, text, styles=None):
+        """Plan the typing of `text`. `styles` optionally gives BOLD/ITALIC bits
+        per character; they are switched with Ctrl+B / Ctrl+I as the text goes."""
         rng, u = self.rng, self.rng.uniform
-        tokens = re.findall(r"\S+|\s", text)
+        S = styles or [0] * len(text)
+        matches = list(re.finditer(r"\S+|\s", text))
+        tokens = [m.group() for m in matches]
         sentence_start, after_clause, skip_space, first = True, False, False, True
         for idx, tok in enumerate(tokens):
+            a = matches[idx].start()
+            b = a + len(tok)
             if tok.isspace():
                 if tok == "\n":
                     self.review()
-                    self.ch("\n")
+                    self.ch("\n", S[a])
                     self.pause(u(1.0, 4.5) * self.ps)
                     sentence_start = True
                 elif skip_space and tok == " ":
                     pass
                 else:
-                    self.ch(tok)
+                    self.ch(tok, S[a])
                 skip_space = False
                 continue
+            # Slips are only made where the editor's style after a fix is certain:
+            # the word is in one style, and so are the characters around it.
+            st, uniform = S[a], len(set(S[a:b])) == 1
+            first_ok = S[a - 1] == st if a else st == 0
+            settled = uniform and first_ok and (b >= len(S) or S[b] == st)
 
             # speed drifts over the session, per burst and per word
             self.x += -.08 * self.x + rng.gauss(0, .05)
@@ -371,10 +483,11 @@ class Humanizer:
 
             # sometimes leave a slip behind to be revised later
             typed = False
-            if self.revise and tok.isascii() and rng.random() < min(.12, self.error_rate * 1.2):
+            if (self.revise and settled and tok.isascii()
+                    and rng.random() < min(.12, self.error_rate * 1.2)):
                 nxt_space = idx + 2 < len(tokens) and tokens[idx + 1] == " "
                 if bare in SKIPPABLE and tok.isalpha() and nxt_space and not sentence_start:
-                    self.defects.append([self.cur, 0, tok + " "])      # word left out
+                    self.defects.append([self.cur, 0, tok + " ", st])  # word left out
                     skip_space = typed = True
                 else:
                     alt = None
@@ -384,11 +497,13 @@ class Humanizer:
                     elif tok.isalpha() and len(tok) >= 4:               # unnoticed typo
                         alt = self._misspell(tok)
                     if alt:
-                        self.defects.append([self.cur, len(alt), tok])
-                        self.type_str(alt)
+                        self.defects.append([self.cur, len(alt), tok, st])
+                        self.type_str(alt, st)
                         typed = True
-            if not typed:
-                self.type_word(tok)
+            if not typed and uniform:
+                self.type_word(tok, st, first_ok)
+            elif not typed:
+                self.type_str(tok, S[a:b])
 
             end = tok.rstrip("\"')]")[-1:]
             sentence_start = end in (".", "!", "?")
@@ -397,6 +512,8 @@ class Humanizer:
                 self.review()
 
         self.review()
+        if self.style:
+            self._restyle(0)                                 # leave bold/italic off
         if self.shift_down:
             self._emit(self.shift_press + max(.012, self.shift_hold * u(.6, 1.5)),
                        "release", "<shift>")
@@ -419,7 +536,7 @@ def play(events, press, release, stop, clock=time.monotonic, guard=None, on_paus
                 return False
             if kind == "press":
                 if guard and not guard():
-                    shifted = "<shift>" in down
+                    mods = [k for k in down if k in ("<shift>", "<mod>")]
                     for k in reversed(down):
                         release(k)
                     del down[:]
@@ -434,9 +551,9 @@ def play(events, press, release, stop, clock=time.monotonic, guard=None, on_paus
                     if stop.wait(0.4):               # let the window settle
                         return False
                     start += clock() - paused
-                    if shifted:
-                        press("<shift>")
-                        down.append("<shift>")
+                    for k in mods:
+                        press(k)
+                        down.append(k)
                 press(key)
                 down.append(key)
             elif key in down:
@@ -511,32 +628,118 @@ def block_clicks():
     return unblock
 
 
+# Colours follow the NEXUS dark theme: near-black navy, slate text, one cyan accent.
+BG, PANEL, LINE = "#070a12", "#0b1020", "#1c2536"
+FG, FG2, MUTED = "#e6edf7", "#b7c3d6", "#7e8ba3"
+ACCENT, DANGER = "#38bdf8", "#f87171"
+MONO_FONTS = ["Cascadia Code", "Cascadia Mono", "JetBrains Mono", "Consolas", "Menlo",
+              "DejaVu Sans Mono", "Liberation Mono", "Courier New"]
+FORMATS = {  # label: how **bold** / *italic* markers in the text are handled
+    "Apply bold / italic": "apply",
+    "Drop markers, type plain": "strip",
+    "Type exactly as written": "literal",
+}
+
+
 class App:
     def __init__(self, root):
         import tkinter as tk
+        from tkinter import font as tkfont
         from tkinter import ttk
         from pynput import keyboard
+        self.tk = tk
         self.kb = keyboard
         self.controller = keyboard.Controller()
         K = keyboard.Key
         self.keymap = {"<shift>": K.shift, "<backspace>": K.backspace, "<delete>": K.delete,
                        "<left>": K.left, "<right>": K.right, "<enter>": K.enter,
-                       "<tab>": K.tab}
+                       "<tab>": K.tab,
+                       "<mod>": K.cmd if sys.platform == "darwin" else K.ctrl}
         self.root = root
         self.stop = threading.Event()
         self.worker = None
         self.events = queue.Queue()  # messages from other threads -> Tk thread
         self._last_hotkey = 0.0
+        self._restyle_job = None
 
+        # --- look ---------------------------------------------------------------
+        have = set(tkfont.families(root))
+        mono = next((f for f in MONO_FONTS if f in have), "TkFixedFont")
+        f_ui, f_small = (mono, 10), (mono, 9)
+        f_bold, f_head = (mono, 10, "bold"), (mono, 15, "bold")
         root.title("Auto Typer")
-        root.minsize(480, 455)
-        frm = ttk.Frame(root, padding=12)
+        root.configure(bg=BG)
+        root.minsize(620, 600)
+        root.option_add("*TCombobox*Listbox.background", PANEL)
+        root.option_add("*TCombobox*Listbox.foreground", FG)
+        root.option_add("*TCombobox*Listbox.selectBackground", LINE)
+        root.option_add("*TCombobox*Listbox.selectForeground", ACCENT)
+        root.option_add("*TCombobox*Listbox.font", f_ui)
+        st = ttk.Style(root)
+        st.theme_use("clam")
+        st.configure(".", background=BG, foreground=FG, font=f_ui, bordercolor=LINE,
+                     lightcolor=BG, darkcolor=BG, troughcolor=PANEL, focuscolor=BG,
+                     insertcolor=ACCENT, selectbackground=LINE, selectforeground=FG)
+        st.configure("Head.TLabel", foreground=FG, font=f_head)
+        st.configure("Accent.TLabel", foreground=ACCENT, font=f_bold)
+        st.configure("Dim.TLabel", foreground=MUTED, font=f_small)
+        st.configure("Status.TLabel", foreground=FG2)
+        st.configure("TEntry", fieldbackground=PANEL, foreground=FG, bordercolor=LINE,
+                     lightcolor=PANEL, darkcolor=PANEL, padding=4)
+        st.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", PANEL)])
+        st.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG,
+                     arrowcolor=ACCENT, bordercolor=LINE, lightcolor=PANEL,
+                     darkcolor=PANEL, padding=4)
+        st.map("TCombobox", fieldbackground=[("readonly", PANEL)],
+               foreground=[("readonly", FG)], selectbackground=[("readonly", PANEL)],
+               selectforeground=[("readonly", FG)], bordercolor=[("focus", ACCENT)],
+               background=[("active", LINE)])
+        st.configure("TCheckbutton", foreground=FG2, indicatorbackground=PANEL,
+                     indicatorforeground=ACCENT, upperbordercolor=MUTED,
+                     lowerbordercolor=MUTED, padding=2)
+        st.map("TCheckbutton", background=[("active", BG)], foreground=[("active", FG)],
+               indicatorbackground=[("active", PANEL), ("selected", PANEL)],
+               upperbordercolor=[("selected", ACCENT)],
+               lowerbordercolor=[("selected", ACCENT)])
+        st.configure("TButton", background=PANEL, foreground=ACCENT, bordercolor=ACCENT,
+                     lightcolor=PANEL, darkcolor=PANEL, font=f_bold, padding=(18, 7))
+        st.map("TButton", background=[("pressed", LINE), ("active", "#101a30")],
+               lightcolor=[("pressed", LINE), ("active", "#101a30")],
+               darkcolor=[("pressed", LINE), ("active", "#101a30")])
+
+        frm = ttk.Frame(root, padding=(18, 14, 18, 14))
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="Text to type:").pack(anchor="w")
-        self.text = tk.Text(frm, height=8, wrap="word", undo=True)
-        self.text.pack(fill="both", expand=True, pady=(2, 10))
+        head = ttk.Frame(frm)
+        head.pack(fill="x")
+        ttk.Label(head, text=">_", style="Accent.TLabel", font=f_head).pack(side="left")
+        ttk.Label(head, text=" AUTO TYPER", style="Head.TLabel").pack(side="left")
+        ttk.Label(head, text=f"[{HOTKEY_NAME}] start / stop", style="Dim.TLabel").pack(
+            side="right", pady=(6, 0))
+        tk.Frame(frm, bg=LINE, height=1).pack(fill="x", pady=(10, 12))
 
+        def section(title, hint=""):
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=(0, 5))
+            ttk.Label(row, text="// " + title, style="Accent.TLabel").pack(side="left")
+            ttk.Label(row, text=hint, style="Dim.TLabel").pack(side="right")
+
+        section("INPUT", "**bold**   *italic*   # heading")
+        box = tk.Frame(frm, bg=LINE, highlightthickness=0)
+        box.pack(fill="both", expand=True, pady=(0, 14))
+        self.text = tk.Text(
+            box, height=9, wrap="word", undo=True, bg=PANEL, fg=FG, insertbackground=ACCENT,
+            selectbackground=LINE, selectforeground=FG, relief="flat", bd=0, padx=10,
+            pady=8, font=(mono, 11), highlightthickness=1, highlightbackground=LINE,
+            highlightcolor=ACCENT, insertwidth=2, spacing1=1, spacing3=1)
+        self.text.pack(fill="both", expand=True)
+        self.text.tag_configure("b", font=(mono, 11, "bold"), foreground="#ffffff")
+        self.text.tag_configure("i", font=(mono, 11, "italic"))
+        self.text.tag_configure("bi", font=(mono, 11, "bold italic"), foreground="#ffffff")
+        self.text.tag_configure("mark", foreground="#3b4a63")
+        self.text.bind("<<Modified>>", self._on_modified)
+
+        section("PARAMETERS")
         opts = ttk.Frame(frm)
         opts.pack(fill="x")
         self.wpm = tk.StringVar(value="60")
@@ -545,46 +748,101 @@ class App:
         self.start_s = tk.StringVar(value="3")
         self.repeat = tk.StringVar(value="1")
         self.technique = tk.StringVar(value="Touch typing")
+        self.format = tk.StringVar(value=next(iter(FORMATS)))
         self.revise = tk.BooleanVar(value=True)
         self.us_shift = tk.BooleanVar(value=True)
         self.enter_after = tk.BooleanVar(value=False)
         self.lock = tk.BooleanVar(value=False)
         fields = [
-            ("Base speed (WPM, approx)", self.wpm),
-            ("Mistakes (% of keys)", self.errors),
-            ("Pauses and breaks (%)", self.pauses),
-            ("Start countdown (s)", self.start_s),
-            ("Repeat (0 = forever)", self.repeat),
+            ("speed", "wpm, approx", self.wpm),
+            ("mistakes", "% of keys", self.errors),
+            ("pauses", "% of normal", self.pauses),
+            ("countdown", "seconds", self.start_s),
+            ("repeat", "0 = forever", self.repeat),
         ]
-        for i, (label, var) in enumerate(fields):
-            ttk.Label(opts, text=label).grid(row=i // 2, column=(i % 2) * 2, sticky="w", pady=2)
-            ttk.Entry(opts, textvariable=var, width=7).grid(
-                row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=(6, 18))
-        ttk.Label(opts, text="Technique").grid(row=2, column=2, sticky="w")
+        for i, (label, unit, var) in enumerate(fields):
+            r, c = i // 2, (i % 2) * 3
+            ttk.Label(opts, text=label.upper(), style="Dim.TLabel").grid(
+                row=r, column=c, sticky="w", pady=4)
+            ttk.Entry(opts, textvariable=var, width=7, font=f_ui).grid(
+                row=r, column=c + 1, sticky="w", padx=(10, 8))
+            ttk.Label(opts, text=unit, style="Dim.TLabel").grid(
+                row=r, column=c + 2, sticky="w", padx=(0, 28))
+        ttk.Label(opts, text="TECHNIQUE", style="Dim.TLabel").grid(row=2, column=3, sticky="w")
         ttk.Combobox(opts, textvariable=self.technique, values=list(TECHNIQUES),
-                     state="readonly", width=13).grid(row=2, column=3, sticky="w", padx=(6, 0))
+                     state="readonly", width=24, font=f_ui).grid(
+            row=2, column=4, columnspan=2, sticky="w", padx=(10, 0))
+        ttk.Label(opts, text="FORMATTING", style="Dim.TLabel").grid(
+            row=3, column=0, sticky="w", pady=4)
+        fmt = ttk.Combobox(opts, textvariable=self.format, values=list(FORMATS),
+                           state="readonly", width=24, font=f_ui)
+        fmt.grid(row=3, column=1, columnspan=3, sticky="w", padx=(10, 0))
+        fmt.bind("<<ComboboxSelected>>", lambda e: self._restyle_text())
         checks = [
-            ("Revise with arrow keys and Delete (off = Backspace only)", self.revise),
+            ("revise with arrow keys and Delete (off = Backspace only)", self.revise),
             ("US keyboard layout (hold Shift for symbols)", self.us_shift),
-            ("Press Enter after each repeat", self.enter_after),
-            ("Lock onto the text box: ignore mouse clicks while typing", self.lock),
+            ("press Enter after each repeat", self.enter_after),
+            ("lock onto the text box: ignore mouse clicks while typing", self.lock),
         ]
         for i, (label, var) in enumerate(checks):
             ttk.Checkbutton(opts, text=label, variable=var).grid(
-                row=3 + i, column=0, columnspan=4, sticky="w", pady=(6 if i == 0 else 0, 0))
+                row=4 + i, column=0, columnspan=6, sticky="w", pady=(10 if i == 0 else 1, 0))
 
+        tk.Frame(frm, bg=LINE, height=1).pack(fill="x", pady=(14, 12))
         bar = ttk.Frame(frm)
-        bar.pack(fill="x", pady=(12, 0))
-        self.button = ttk.Button(bar, text=f"Start ({HOTKEY_NAME})", command=self.toggle)
+        bar.pack(fill="x")
+        self.button = ttk.Button(bar, text="[ START ]", command=self.toggle, cursor="hand2")
         self.button.pack(side="left")
-        self.status = tk.StringVar(value=f"Ready. {HOTKEY_NAME} starts/stops from any window.")
-        ttk.Label(bar, textvariable=self.status).pack(side="left", padx=10)
+        ttk.Label(bar, text=">", style="Accent.TLabel").pack(side="left", padx=(14, 6))
+        self.status = tk.StringVar(value=f"ready. {HOTKEY_NAME} starts and stops from any window")
+        self.status_label = ttk.Label(bar, textvariable=self.status, style="Status.TLabel")
+        self.status_label.pack(side="left")
 
+        self._dark_title_bar()
         self.listener = keyboard.Listener(on_press=self._on_key)
         self.listener.daemon = True
         self.listener.start()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._poll()
+
+    def _dark_title_bar(self):
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            on = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(on), 4)
+        except Exception:
+            pass
+
+    # --- formatting preview in the text box -----------------------------------
+    def _on_modified(self, _event=None):
+        if self.text.edit_modified():
+            self.text.edit_modified(False)
+            if self._restyle_job:
+                self.root.after_cancel(self._restyle_job)
+            self._restyle_job = self.root.after(120, self._restyle_text)
+
+    def _restyle_text(self):
+        """Show marked text as bold/italic and grey out the markers themselves."""
+        self._restyle_job = None
+        t = self.text
+        for tag in ("b", "i", "bi", "mark"):
+            t.tag_remove(tag, "1.0", "end")
+        if FORMATS[self.format.get()] == "literal":
+            return
+        src = t.get("1.0", "end-1c")
+        tags = ["mark"] * len(src)
+        for i, _c, style in parse_markup(src):
+            tags[i] = {0: None, BOLD: "b", ITALIC: "i"}.get(style, "bi")
+        start = 0
+        for i in range(1, len(src) + 1):
+            if i == len(src) or tags[i] != tags[start]:
+                if tags[start]:
+                    t.tag_add(tags[start], f"1.0+{start}c", f"1.0+{i}c")
+                start = i
 
     # --- cross-thread plumbing -------------------------------------------
     def _on_key(self, key):
@@ -600,13 +858,18 @@ class App:
                 if kind == "toggle":
                     self.toggle()
                 elif kind == "status":
-                    self.status.set(value)
+                    self._say(value)
                 elif kind == "done":
-                    self.button.config(text=f"Start ({HOTKEY_NAME})")
-                    self.status.set(value)
+                    self.button.config(text="[ START ]")
+                    self._say(value)
         except queue.Empty:
             pass
         self.root.after(50, self._poll)
+
+    def _say(self, message):
+        self.status.set(message[:1].lower() + message[1:])
+        bad = message.startswith(("Error", "Nothing", "Settings"))
+        self.status_label.configure(foreground=DANGER if bad else FG2)
 
     # --- actions ------------------------------------------------------------
     def running(self):
@@ -618,7 +881,7 @@ class App:
             return
         text = self.text.get("1.0", "end-1c")
         if not text:
-            self.status.set("Nothing to type.")
+            self._say("Nothing to type.")
             return
         try:
             opts = dict(
@@ -631,16 +894,23 @@ class App:
             countdown = max(0, int(float(self.start_s.get())))
             repeat = max(0, int(float(self.repeat.get())))
         except ValueError:
-            self.status.set("Settings must be numbers.")
+            self._say("Settings must be numbers.")
             return
         self.stop.clear()
-        self.button.config(text=f"Stop ({HOTKEY_NAME})")
+        mode, styles = FORMATS[self.format.get()], None
+        if mode != "literal":
+            parsed = parse_markup(text)
+            text = "".join(c for _, c, _ in parsed)
+            if mode == "apply" and any(s for _, _, s in parsed):
+                styles = [s for _, _, s in parsed]
+        self.button.config(text="[ STOP ]")
         self.worker = threading.Thread(
             target=self._run, daemon=True,
-            args=(text, opts, countdown, repeat, self.enter_after.get(), self.lock.get()))
+            args=(text, styles, opts, countdown, repeat, self.enter_after.get(),
+                  self.lock.get()))
         self.worker.start()
 
-    def _run(self, text, opts, countdown, repeat, enter_after, lock):
+    def _run(self, text, styles, opts, countdown, repeat, enter_after, lock):
         for s in range(countdown, 0, -1):
             self.events.put(("status", f"Starting in {s}... click the target window"))
             if self.stop.wait(1):
@@ -671,7 +941,7 @@ class App:
         n = 0
         try:
             while not self.stop.is_set() and (repeat == 0 or n < repeat):
-                plan = Humanizer(**opts).run(text)   # a fresh rhythm every time
+                plan = Humanizer(**opts).run(text, styles)   # a fresh rhythm every time
                 secs = int(plan[-1][0]) if plan else 0
                 self.events.put(("status", f"{typing}, about {secs // 60}:{secs % 60:02d}"
                                            f" - {HOTKEY_NAME} to stop{note}"))
