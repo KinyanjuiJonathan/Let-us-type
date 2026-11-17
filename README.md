@@ -9,7 +9,9 @@ what you entered.
 
 Download `AutoTyperSetup.exe` from the
 [latest release](https://github.com/KinyanjuiJonathan/Let-us-type/releases/latest)
-and run it. No Python needed. The installer is not code-signed, so Windows
+and run it. Between releases, every push to `main` also builds one: open the
+newest run under the repository's Actions tab and download the
+`AutoTyperSetup` artifact. No Python needed. The installer is not code-signed, so Windows
 SmartScreen may warn: choose "More info", then "Run anyway".
 
 ## Run from source
