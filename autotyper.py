@@ -18,6 +18,7 @@ import math
 import queue
 import random
 import re
+import sys
 import threading
 import time
 
@@ -404,8 +405,12 @@ class Humanizer:
         return self.ev
 
 
-def play(events, press, release, stop, clock=time.monotonic):
-    """Replay planned events in real time. Returns False if stopped early."""
+def play(events, press, release, stop, clock=time.monotonic, guard=None, on_pause=None):
+    """Replay planned events in real time. Returns False if stopped early.
+
+    If `guard` is given, typing holds while guard() is false and carries on
+    from the same place once it is true again.
+    """
     down, start = [], clock()
     try:
         for t, _, kind, key in events:
@@ -413,16 +418,97 @@ def play(events, press, release, stop, clock=time.monotonic):
             if (wait > 0 and stop.wait(wait)) or stop.is_set():
                 return False
             if kind == "press":
+                if guard and not guard():
+                    shifted = "<shift>" in down
+                    for k in reversed(down):
+                        release(k)
+                    del down[:]
+                    paused = clock()
+                    if on_pause:
+                        on_pause(True)
+                    while not guard():
+                        if stop.wait(0.2):
+                            return False
+                    if on_pause:
+                        on_pause(False)
+                    if stop.wait(0.4):               # let the window settle
+                        return False
+                    start += clock() - paused
+                    if shifted:
+                        press("<shift>")
+                        down.append("<shift>")
                 press(key)
                 down.append(key)
-            else:
+            elif key in down:
                 release(key)
-                if key in down:
-                    down.remove(key)
+                down.remove(key)
         return True
     finally:
         for key in reversed(down):   # never leave a key stuck down
             release(key)
+
+
+def focus_probe():
+    """Return a function that identifies the window holding keyboard focus,
+    or None where that can't be read."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            return ctypes.windll.user32.GetForegroundWindow
+        if sys.platform == "darwin":
+            import Quartz
+
+            def front():
+                opts = (Quartz.kCGWindowListOptionOnScreenOnly
+                        | Quartz.kCGWindowListExcludeDesktopElements)
+                for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID):
+                    if w.get("kCGWindowLayer") == 0:
+                        return w.get("kCGWindowOwnerPID")
+            return front
+        from Xlib import X, display
+        d = display.Display()
+        root, atom = d.screen().root, d.intern_atom("_NET_ACTIVE_WINDOW")
+
+        def active():
+            prop = root.get_full_property(atom, X.AnyPropertyType)
+            if prop and len(prop.value) and prop.value[0]:
+                return int(prop.value[0])
+            w = d.get_input_focus().focus
+            return getattr(w, "id", w)
+        return active
+    except Exception:
+        return None
+
+
+def block_clicks():
+    """Swallow mouse clicks system-wide (the pointer still moves).
+    Returns a function that lets clicks through again."""
+    from pynput import mouse
+    if sys.platform == "win32":
+        clicks = {0x201, 0x202, 0x203, 0x204, 0x205, 0x206, 0x207, 0x208, 0x209,
+                  0x20B, 0x20C, 0x20D}
+
+        def filt(msg, data):
+            if msg in clicks:
+                listener.suppress_event()
+        listener = mouse.Listener(win32_event_filter=filt)
+    elif sys.platform == "darwin":
+        clicks = {1, 2, 3, 4, 25, 26}                # left/right/other down and up
+        listener = mouse.Listener(
+            darwin_intercept=lambda etype, event: None if etype in clicks else event)
+    else:
+        listener = mouse.Listener(suppress=True)
+    listener.start()
+
+    def unblock():
+        listener.stop()
+        if sys.platform not in ("win32", "darwin"):
+            # On X11 the grab is only dropped at the next pointer event: nudge it.
+            pointer = mouse.Controller()
+            pointer.move(1, 0)
+            pointer.move(-1, 0)
+            listener.join(1)
+    return unblock
 
 
 class App:
@@ -443,7 +529,7 @@ class App:
         self._last_hotkey = 0.0
 
         root.title("Auto Typer")
-        root.minsize(480, 430)
+        root.minsize(480, 455)
         frm = ttk.Frame(root, padding=12)
         frm.pack(fill="both", expand=True)
 
@@ -462,6 +548,7 @@ class App:
         self.revise = tk.BooleanVar(value=True)
         self.us_shift = tk.BooleanVar(value=True)
         self.enter_after = tk.BooleanVar(value=False)
+        self.lock = tk.BooleanVar(value=False)
         fields = [
             ("Base speed (WPM, approx)", self.wpm),
             ("Mistakes (% of keys)", self.errors),
@@ -480,6 +567,7 @@ class App:
             ("Revise with arrow keys and Delete (off = Backspace only)", self.revise),
             ("US keyboard layout (hold Shift for symbols)", self.us_shift),
             ("Press Enter after each repeat", self.enter_after),
+            ("Lock onto the text box: ignore mouse clicks while typing", self.lock),
         ]
         for i, (label, var) in enumerate(checks):
             ttk.Checkbutton(opts, text=label, variable=var).grid(
@@ -549,10 +637,10 @@ class App:
         self.button.config(text=f"Stop ({HOTKEY_NAME})")
         self.worker = threading.Thread(
             target=self._run, daemon=True,
-            args=(text, opts, countdown, repeat, self.enter_after.get()))
+            args=(text, opts, countdown, repeat, self.enter_after.get(), self.lock.get()))
         self.worker.start()
 
-    def _run(self, text, opts, countdown, repeat, enter_after):
+    def _run(self, text, opts, countdown, repeat, enter_after, lock):
         for s in range(countdown, 0, -1):
             self.events.put(("status", f"Starting in {s}... click the target window"))
             if self.stop.wait(1):
@@ -560,14 +648,34 @@ class App:
                 return
         press = lambda k: self.controller.press(self.keymap.get(k, k))
         release = lambda k: self.controller.release(self.keymap.get(k, k))
+        guard, unblock, typing, note = None, None, "Typing", ""
+        if lock:
+            # The target is whatever has focus the moment typing begins.
+            probe = focus_probe()
+            if probe:
+                target, seen = probe(), [0.0, True]
+
+                def guard():
+                    if time.monotonic() - seen[0] > 0.1:
+                        seen[:] = [time.monotonic(), probe() == target]
+                    return seen[1]
+            try:
+                unblock = block_clicks()
+                typing = "Locked"
+            except Exception:
+                note = " (could not block clicks)"
+
+        def on_pause(paused):
+            self.events.put(("status", "Paused - go back to the target window"
+                             if paused else f"{typing} - {HOTKEY_NAME} to stop"))
         n = 0
         try:
             while not self.stop.is_set() and (repeat == 0 or n < repeat):
                 plan = Humanizer(**opts).run(text)   # a fresh rhythm every time
                 secs = int(plan[-1][0]) if plan else 0
-                self.events.put(("status", f"Typing, about {secs // 60}:{secs % 60:02d}"
-                                           f" - {HOTKEY_NAME} to stop"))
-                if not play(plan, press, release, self.stop):
+                self.events.put(("status", f"{typing}, about {secs // 60}:{secs % 60:02d}"
+                                           f" - {HOTKEY_NAME} to stop{note}"))
+                if not play(plan, press, release, self.stop, guard=guard, on_pause=on_pause):
                     break
                 if enter_after:
                     self.stop.wait(random.uniform(.2, .7))
@@ -578,6 +686,9 @@ class App:
         except Exception as e:  # e.g. a character the keyboard layout can't produce
             self.events.put(("done", f"Error: {e}"))
             return
+        finally:
+            if unblock:
+                unblock()
         self.events.put(("done", "Stopped." if self.stop.is_set() else "Done."))
 
     def close(self):
